@@ -20,7 +20,7 @@ from aiogram.types import (
 
 # ==== НАСТРОЙКИ ====
 import os
-API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API_TOKEN = os.getenv(8278332572:AAEraxNTF4-01luv6A0mwkqv7zL-zBRKag0)
 ADMIN_IDS = {1790286972}
 ADMIN_CHAT_IDS = {-1002362042916}
 
@@ -735,3 +735,4 @@ if __name__ == "__main__":
         print("⚠️ Критическая ошибка при старте:", type(e).__name__, e)
         traceback.print_exc()
         input("\nНажмите Enter, чтобы закрыть окно...")
+
