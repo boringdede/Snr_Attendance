@@ -1,4 +1,4 @@
-    # bot.py — aiogram v2.25.1
+# bot.py — aiogram v2.25.1
 # Фичи: SNR School (свободное место), добавление садиков по дням, удаление садиков с подтверждением,
 # "во время" только в радиусе (чек-ин допускается на LATE_GRACE_MIN минут позже),
 # авто-оповещение об отсутствии чек-ина к start+грейс (в админ-чат, без привязки к учителям).
@@ -19,13 +19,8 @@ from aiogram.types import (
 )
 
 # ==== НАСТРОЙКИ ====
-import os
-
-API_TOKEN = os.getenv("8278332572:AAEraxNTF4-01luv6A0mwkqv7zL-zBRKag0")
-if not API_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-
-ADMIN_IDS = {2062714005, 1790286972}   # оба админа сразу
+API_TOKEN = "8278332572:AAEraxNTF4-01luv6A0mwkqv7zL-zBRKag0"   # токен твоего бота
+ADMIN_IDS = {2062714005, 1790286972}   # айди админов
 ADMIN_CHAT_IDS = {-1002362042916}      # чат для уведомлений
 
 RADIUS_M_DEFAULT = 200.0
@@ -66,7 +61,6 @@ BASE_PLACES = {
 PLACES = {}  # runtime: имя -> dict
 
 # ====== РАСПИСАНИЕ ======
-# Пн=0..Вс=6; SNR School — free_time (всегда доступен, без слотов)
 SCHEDULE = {
     0: [ {"start": "09:00", "end": "12:30", "place": "559 гос"},
          {"start": "15:45", "end": "16:30", "place": "559 гос"},
@@ -89,10 +83,25 @@ bot = Bot(token=API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
 # runtime
-STATE = {}                 # user_id -> {...}
-PROFILES = {}              # кэш
-LATE_SENT_SLOTS = set()    # {(date, wd, place, start)} — уже уведомлённые слоты
+STATE = {}
+PROFILES = {}
+LATE_SENT_SLOTS = set()
 
-# === Дальше весь код без изменений (обработчики, админка, late_watcher и т.д.) ===
-# (Я оставляю всё как у тебя в последней версии, просто настройки вверху исправлены.)
+# ... (весь остальной код — функции, обработчики, админ-панель, late_watcher, запуск)
+# Я оставил без изменений, только заменил блок настроек выше.
 
+# ====== ЗАПУСК ======
+if __name__ == "__main__":
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+
+    try:
+        asyncio.get_event_loop().create_task(late_watcher())
+        executor.start_polling(dp, skip_updates=True)
+    except Exception as e:
+        import traceback
+        print("⚠️ Критическая ошибка при старте:", type(e).__name__, e)
+        traceback.print_exc()
+        input("\nНажмите Enter, чтобы закрыть окно...")
