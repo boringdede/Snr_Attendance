@@ -24,7 +24,7 @@ API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or HARDCODED_FALLBACK_TOKEN
 if not API_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (и HARDCODED_FALLBACK_TOKEN не задан).")
 
-ADMIN_IDS = {1790286972}             # добавь ещё id админов при необходимости
+ADMIN_IDS = {1790286972,2062714005}             # добавь ещё id админов при необходимости
 ADMIN_CHAT_IDS = {-1002362042916}    # куда слать уведомления
 
 RADIUS_M_DEFAULT = 200.0
@@ -848,3 +848,4 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(late_watcher())
     executor.start_polling(dp, skip_updates=True)
+
