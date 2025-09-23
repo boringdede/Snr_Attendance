@@ -1,7 +1,5 @@
-# bot.py — aiogram v2.25.1
-# Фичи: SNR School (свободное место), добавление садиков по дням, удаление садиков с подтверждением,
-# "во время" только в радиусе (чек-ин допускается на LATE_GRACE_MIN минут позже),
-# авто-оповещение об отсутствии чек-ина к start+грейс (в админ-чат, без привязки к учителям).
+# bot.py — Полный рабочий файл (aiogram v2.25.1)
+# pip install aiogram==2.25.1
 
 import csv
 import logging
@@ -10,6 +8,7 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import os
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.exceptions import Throttled
@@ -18,28 +17,25 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
-# ==== НАСТРОЙКИ ====
-import os
-
-# 1) безопасно: из переменной окружения TELEGRAM_BOT_TOKEN
-# 2) фолбэк: жёстко вписанный токен ниже (можешь удалить, если держишь токен в Render)
-API_TOKEN = "8278332572:AAEraxNTF4-01luv6A0mwkqv7zL-zBRKag0"
+# ============ НАСТРОЙКИ ============
+# НЕ коммить в публичный репозиторий с реальным токеном!
+HARDCODED_FALLBACK_TOKEN = "8278332572:AAFT7ijU1Gc_I3KmXsmD7QNXaWSY-OXd39A"  # ← подставь локально (или используй env)
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or HARDCODED_FALLBACK_TOKEN
 if not API_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set and fallback token is empty")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (и HARDCODED_FALLBACK_TOKEN не задан).")
 
-# админы и чат уведомлений
-ADMIN_IDS = {1790286972, 2062714005}
-ADMIN_CHAT_IDS = {-1002362042916}
+ADMIN_IDS = {1790286972}             # добавь ещё id админов при необходимости
+ADMIN_CHAT_IDS = {-1002362042916}    # куда слать уведомления
 
 RADIUS_M_DEFAULT = 200.0
-CITY_TZ_HOURS = 5         # Asia/Tashkent UTC+5
-LATE_GRACE_MIN = 10       # грейс к началу слота (минуты) для "во время" и штрафов
+CITY_TZ_HOURS = 5
+LATE_GRACE_MIN = 10
 
 # ---- ЛОГИ ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("snr-checkin-bot")
 
-# Часовой пояс (с фолбэком)
+# Часовой пояс
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
     try:
@@ -54,33 +50,32 @@ DATA_DIR = Path("."); DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHECKS_CSV = DATA_DIR / "checks.csv"
 PROFILES_CSV = DATA_DIR / "profiles.csv"
 
-# ====== МЕСТА (база по умолчанию) + SNR ======
+# ====== МЕСТА ======
 BASE_PLACES = {
     "SNR School": {"full": "SNR School (офис)", "lat": 41.322921, "lon": 69.277808, "radius_m": 200.0, "free_time": True},
     "559 гос": {"full": "559 государственный садик", "lat": 41.303288, "lon": 69.292031, "radius_m": 200.0, "free_time": False},
     "First kids": {"full": "First kids", "lat": 41.329848, "lon": 69.286872, "radius_m": 200.0, "free_time": False},
-    "FIRST":      {"full": "First kids", "lat": 41.329848, "lon": 69.286872, "radius_m": 200.0, "free_time": False},
     "Domik": {"full": "ДОМИК", "lat": 41.321701, "lon": 69.315380, "radius_m": 200.0, "free_time": False},
     "Small steps": {"full": "Small steps", "lat": 41.294155, "lon": 69.189863, "radius_m": 200.0, "free_time": False},
     "STARKIDS": {"full": "STARKIDS", "lat": 41.298992, "lon": 69.260579, "radius_m": 200.0, "free_time": False},
     "Академия Талантов": {"full": "Академия Талантов", "lat": 41.313393, "lon": 69.294289, "radius_m": 200, "free_time": False},
     "324 гос": {"full": "324 государственный садик", "lat": 41.335171, "lon": 69.335863, "radius_m": 200, "free_time": False},
 }
-PLACES = {}  # runtime: имя -> dict
+PLACES = {}
 
 # ====== РАСПИСАНИЕ ======
-# Пн=0..Вс=6; SNR School — free_time (всегда доступен, без слотов)
+# SCHEDULE[weekday] = list[ {"start","end","place"} ]
 SCHEDULE = {
     0: [ {"start": "09:00", "end": "12:30", "place": "559 гос"},
          {"start": "15:45", "end": "16:30", "place": "559 гос"},
          {"start": "10:00", "end": "11:30", "place": "First kids"} ],
-    1: [ {"start": "10:30", "end": "11:00", "place": "ДОМИК"},
+    1: [ {"start": "10:30", "end": "11:00", "place": "Domik"},
          {"start": "15:00", "end": "16:00", "place": "324 гос"} ],
     2: [ {"start": "09:00", "end": "12:30", "place": "559 гос"},
          {"start": "15:45", "end": "16:30", "place": "559 гос"},
          {"start": "10:00", "end": "11:00", "place": "Small steps"},
          {"start": "10:30", "end": "16:30", "place": "Академия Талантов"} ],
-    3: [ {"start": "10:30", "end": "11:00", "place": "ДОМИК"} ],
+    3: [ {"start": "10:30", "end": "11:00", "place": "Domik"} ],
     4: [ {"start": "09:30", "end": "12:30", "place": "STARKIDS"},
          {"start": "15:00", "end": "16:00", "place": "324 гос"} ],
     5: [],
@@ -92,9 +87,9 @@ bot = Bot(token=API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
 # runtime
-STATE = {}                 # user_id -> {"phase": "...", ...}
-PROFILES = {}              # кэш: user_id -> {"name":..., "phone":...}
-LATE_SENT_SLOTS = set()    # {(date, wd, place, start)} — уже уведомлённые слоты
+STATE = {}              # user_id -> {...}
+PROFILES = {}
+LATE_SENT_SLOTS = set()
 
 # ====== УТИЛИТЫ ======
 def ensure_files():
@@ -113,14 +108,12 @@ def ensure_files():
             csv.writer(f, delimiter=";").writerow(["telegram_id","teacher_name","phone"])
 
 def safe_dict_reader(path: Path):
-    if not path.exists():
-        return []
-    rows = []
+    if not path.exists(): return []
+    rows=[]
     with path.open("r", encoding="utf-8", newline="") as f:
         r = csv.DictReader(f, delimiter=";")
         for row in r:
-            if row:
-                rows.append(row)
+            if row: rows.append(row)
     return rows
 
 def load_profiles_cache():
@@ -137,6 +130,9 @@ def load_places_runtime():
 
 def weekday_ru(dt: datetime) -> str:
     return ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"][dt.weekday()]
+
+def day_short(wd: int) -> str:
+    return ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"][wd]
 
 def haversine_m(lat1, lon1, lat2, lon2) -> float:
     R = 6371000.0
@@ -164,13 +160,6 @@ def ask_contact_kb():
     kb.add(KeyboardButton("Назад в меню"))
     return kb
 
-def slots_kb(day_slots):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🏢 SNR School — свободное время", callback_data="slot_snr"))
-    for i, s in enumerate(day_slots):
-        kb.add(InlineKeyboardButton(f"{s['place']} — {s['start']}–{s['end']}", callback_data=f"slot:{i}"))
-    return kb
-
 def actions_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Чек-ин (приход)", callback_data="act:in"))
@@ -178,23 +167,21 @@ def actions_kb():
     return kb
 
 def load_profile(uid: int):
-    if uid in PROFILES:
-        return PROFILES[uid]
+    if uid in PROFILES: return PROFILES[uid]
     for row in safe_dict_reader(PROFILES_CSV):
         if row.get("telegram_id") == str(uid):
             PROFILES[uid] = {"name": row["teacher_name"], "phone": row["phone"]}
             return PROFILES[uid]
     return None
 
-def save_profile(uid: int, name: str, phone: str | None):
+def save_profile(uid: int, name: str, phone: str|None):
     rows = {}
     for row in safe_dict_reader(PROFILES_CSV):
         try:
-            rows[int(row["telegram_id"])] = (row["teacher_name"], row.get("phone", ""))
+            rows[int(row["telegram_id"])] = (row["teacher_name"], row.get("phone",""))
         except Exception:
             continue
-    if uid in rows:
-        return
+    if uid in rows: return
     rows[uid] = (name, phone or "")
     with PROFILES_CSV.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, delimiter=";")
@@ -208,7 +195,7 @@ async def notify_admins(text: str):
         with suppress(Exception):
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
 
-# ====== ПАРСИНГ ДНЕЙ НЕДЕЛИ ======
+# ====== ПАРСИНГ ДНЕЙ ======
 RU_DAYS = {
     "пн":0, "пон":0, "понедельник":0,
     "вт":1, "вторник":1,
@@ -225,18 +212,14 @@ def parse_days(text: str):
     parts = re.split(r"[,\s;]+", txt)
     out = []
     for p in parts:
-        if not p:
-            continue
+        if not p: continue
         if p.isdigit():
             n = int(p)
-            if n in range(7):
-                out.append(n)
-            elif n in range(1, 8):
-                out.append(n - 1)
+            if n in range(7): out.append(n)
+            elif n in range(1,8): out.append(n-1)
         else:
             p = p.strip(".")
-            if p in RU_DAYS:
-                out.append(RU_DAYS[p])
+            if p in RU_DAYS: out.append(RU_DAYS[p])
     return sorted(set(out))
 
 # ====== /start ======
@@ -255,7 +238,7 @@ async def on_start(message: types.Message):
     STATE[uid] = {"phase": "idle"}
     await message.answer(f"Привет, <b>{prof['name']}</b>! Что делаем?", reply_markup=main_kb(uid))
 
-# ====== вспомогательные команды ======
+# ====== вспомогательные ======
 @dp.message_handler(commands=["id"])
 async def cmd_id(message: types.Message):
     await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
@@ -286,9 +269,11 @@ async def admin_menu(message: types.Message):
         await message.answer("⛔ У вас нет доступа к админ-панели.")
         return
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("➕ Добавить садик (пошагово)", callback_data="admin:add_wizard"))
-    kb.add(InlineKeyboardButton("📋 Список садиков", callback_data="admin:list_places"))
-    kb.add(InlineKeyboardButton("🗑 Удалить садик", callback_data="admin:del_place"))
+    kb.add(InlineKeyboardButton("➕ Добавить школу/садик (пошагово)", callback_data="admin:add_wizard"))
+    kb.add(InlineKeyboardButton("➕ Добавить урок к школе", callback_data="admin:add_lesson"))
+    kb.add(InlineKeyboardButton("📋 Список школ/садиков", callback_data="admin:list_places"))
+    kb.add(InlineKeyboardButton("🗑 Удалить урок (в школе)", callback_data="admin:del_lesson"))
+    kb.add(InlineKeyboardButton("🗑 Удалить школу/садик полностью", callback_data="admin:del_place"))
     kb.add(InlineKeyboardButton("📆 Слоты на сегодня", callback_data="admin:list_today"))
     await message.answer("🔧 Панель администратора:", reply_markup=kb)
 
@@ -299,12 +284,11 @@ async def text_router(message: types.Message):
     txt = (message.text or "").strip()
     st = STATE.get(uid, {})
 
-    # перехват /admin
+    # /admin
     if txt.startswith("/admin"):
-        await admin_menu(message)
-        return
+        await admin_menu(message); return
 
-    # Визард добавления: шаг 1 — имя
+    # Визард добавления НОВОЙ ШКОЛЫ/САДИКА
     if st.get("phase") == "add_place_name" and uid in ADMIN_IDS:
         name = txt
         if not name:
@@ -317,7 +301,6 @@ async def text_router(message: types.Message):
         await message.answer("Координаты: отправьте <code>широта, долгота</code>\nНапример: <code>41.300000, 69.300000</code>")
         return
 
-    # шаг 2 — координаты
     if st.get("phase") == "add_place_coords" and uid in ADMIN_IDS:
         m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", txt)
         if not m:
@@ -326,14 +309,13 @@ async def text_router(message: types.Message):
         lat = float(m.group(1)); lon = float(m.group(2))
         st["new_place"]["lat"] = lat; st["new_place"]["lon"] = lon
         STATE[uid] = {"phase": "add_place_times", "new_place": st["new_place"]}
-        await message.answer("Время слота: <code>HH:MM-HH:MM</code>\nНапример: <code>09:00-12:30</code>")
+        await message.answer("Время урока: <code>HH:MM-HH:MM</code> (напр. 09:00-09:40). Это время потом применим к выбранным дням.")
         return
 
-    # шаг 3 — время
     if st.get("phase") == "add_place_times" and uid in ADMIN_IDS:
         m = re.fullmatch(r"\s*(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\s*", txt)
         if not m:
-            await message.answer("Время не распознано. Пример: <code>09:00-12:30</code>")
+            await message.answer("Время не распознано. Пример: <code>09:00-09:40</code>")
             return
         start_s = f"{m.group(1)}:{m.group(2)}"
         end_s   = f"{m.group(3)}:{m.group(4)}"
@@ -341,37 +323,64 @@ async def text_router(message: types.Message):
         st["new_place"]["end"] = end_s
         STATE[uid] = {"phase": "add_place_days", "new_place": st["new_place"]}
         await message.answer(
-            "Дни недели (через запятую):\n"
-            "- числа 1-7 или 0-6 (Пн=1/0 ... Вс=7/6),\n"
-            "- или названия: пн, вт, ср, чт, пт, сб, вс,\n"
-            "- или «все».\n"
-            "Например: <code>пн, ср, пт</code> или <code>1,3,5</code>"
+            "Дни недели (через запятую), можно полные названия: Понедельник, Вторник ...\n"
+            "Пример: <code>Понедельник, Среда, Пятница</code>"
         )
         return
 
-    # шаг 4 — дни
     if st.get("phase") == "add_place_days" and uid in ADMIN_IDS:
         days = parse_days(txt)
         if not days:
-            await message.answer("Дни не распознаны. Пример: <code>пн, ср, пт</code> или <code>1,3,5</code>")
+            await message.answer("Дни не распознаны. Пример: <code>Понедельник, Среда</code>")
             return
         np = st["new_place"]
         name, lat, lon = np["name"], np["lat"], np["lon"]
         start_s, end_s = np["start"], np["end"]
 
-        # 1) добавляем место
         PLACES[name] = {"full": name, "lat": lat, "lon": lon, "radius_m": RADIUS_M_DEFAULT, "free_time": False}
-        # 2) добавляем слоты только в выбранные дни
         for wd in days:
             SCHEDULE.setdefault(wd, []).append({"start": start_s, "end": end_s, "place": name})
 
         STATE[uid] = {"phase": "idle"}
-        days_ru = ", ".join(["Пн","Вт","Ср","Чт","Пт","Сб","Вс"][d] for d in days)
-        await message.answer(
-            f"✅ Садик «{name}» добавлен.\nКоординаты: {lat}, {lon}\nВремя: {start_s}–{end_s}\nДни: {days_ru}"
-        )
+        days_ru = ", ".join(day_short(d) for d in days)
+        await message.answer(f"✅ «{name}» добавлен. Урок {start_s}–{end_s} в дни: {days_ru}")
         return
 
+    # Добавление УРОКА к существующей школе (из админки)
+    if st.get("phase") == "add_lesson_choose_school" and uid in ADMIN_IDS:
+        school = txt
+        if school not in PLACES:
+            await message.answer("Школа не найдена. Введите точное название из списка.")
+            return
+        STATE[uid] = {"phase": "add_lesson_time", "school": school}
+        await message.answer(f"Школа: {school}\nВведите время урока <code>HH:MM-HH:MM</code> (напр. 09:00-09:40)")
+        return
+
+    if st.get("phase") == "add_lesson_time" and uid in ADMIN_IDS:
+        m = re.fullmatch(r"\s*(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\s*", txt)
+        if not m:
+            await message.answer("Время не распознано. Пример: <code>09:00-09:40</code>")
+            return
+        start_s = f"{m.group(1)}:{m.group(2)}"; end_s = f"{m.group(3)}:{m.group(4)}"
+        st["start"] = start_s; st["end"] = end_s
+        STATE[uid] = {"phase": "add_lesson_days", "school": st["school"], "start": start_s, "end": end_s}
+        await message.answer("В какие дни добавить? (полные названия через запятую, напр.: Понедельник, Среда)")
+        return
+
+    if st.get("phase") == "add_lesson_days" and uid in ADMIN_IDS:
+        days = parse_days(txt)
+        if not days:
+            await message.answer("Дни не распознаны. Пример: <code>Понедельник, Среда</code>")
+            return
+        school = st["school"]; start_s = st["start"]; end_s = st["end"]
+        for wd in days:
+            SCHEDULE.setdefault(wd, []).append({"start": start_s, "end": end_s, "place": school})
+        STATE[uid] = {"phase": "idle"}
+        days_ru = ", ".join(day_short(d) for d in days)
+        await message.answer(f"✅ Урок {start_s}–{end_s} добавлен в «{school}» (дни: {days_ru})")
+        return
+
+    # Пользовательские команды
     if txt == "Назад в меню":
         STATE[uid] = {"phase": "idle"}
         await message.answer("Главное меню:", reply_markup=main_kb(uid))
@@ -393,12 +402,27 @@ async def text_router(message: types.Message):
         await cmd_schedule(message)
         return
 
+    # === НОВЫЙ ФЛОУ ЧЕК-ИНА: СНАЧАЛА ШКОЛА, ПОТОМ ВРЕМЯ ===
     if txt == "Отметиться (выбрать слот)":
         now = datetime.now(TZ); wd = now.weekday()
-        day = SCHEDULE.get(wd, [])
-        STATE[uid] = {"phase": "pick_slot"}
-        await message.answer("Выберите место/слот:", reply_markup=types.ReplyKeyboardRemove())
-        await message.answer("⬇️ Нажмите на нужный:", reply_markup=slots_kb(day))
+        today = SCHEDULE.get(wd, [])
+
+        # список школ на сегодня
+        schools_today = sorted({s["place"] for s in today})
+        # плюс любые free_time места (например SNR School)
+        for name, p in PLACES.items():
+            if p.get("free_time") and name not in schools_today:
+                schools_today.append(name)
+        if not schools_today:
+            await message.answer("На сегодня нет уроков. Доступно только свободное время, если включено.")
+            return
+
+        STATE[uid] = {"phase": "pick_school", "schools_list": schools_today}
+        kb = InlineKeyboardMarkup()
+        for i, name in enumerate(schools_today[:50]):
+            kb.add(InlineKeyboardButton(name, callback_data=f"cs:school:{i}"))
+        await message.answer("Выберите школу/садик:", reply_markup=types.ReplyKeyboardRemove())
+        await message.answer("⬇️ Нажмите на нужную школу:", reply_markup=kb)
         return
 
 # ====== контакт ======
@@ -422,38 +446,69 @@ async def on_contact(message: types.Message):
         reply_markup=main_kb(uid)
     )
 
-# ====== выбор слота ======
-@dp.callback_query_handler(lambda c: c.data.startswith("slot"))
-async def on_slot(callback: types.CallbackQuery):
+# ====== КОЛЛБЭКИ: ЧЕК-ИН ПО ШАГАМ ======
+@dp.callback_query_handler(lambda c: c.data.startswith("cs:school:"))
+async def choose_school(callback: types.CallbackQuery):
     uid = callback.from_user.id
+    st = STATE.get(uid, {})
+    if st.get("phase") != "pick_school":
+        await callback.answer(); return
+    idx = int(callback.data.split(":")[2])
+    schools = st.get("schools_list", [])
+    if idx < 0 or idx >= len(schools):
+        await callback.answer("Не найдено"); return
+    school = schools[idx]
+
     now = datetime.now(TZ); wd = now.weekday()
     day = SCHEDULE.get(wd, [])
+    free_time = PLACES.get(school, {}).get("free_time", False)
 
-    if callback.data == "slot_snr":
-        slot = {"place": "SNR School", "start": "00:00", "end": "23:59", "free_time": True}
-    else:
-        try:
-            idx = int(callback.data.split(":")[1])
-            slot = dict(day[idx])
-            slot["free_time"] = PLACES.get(slot["place"], {}).get("free_time", False)
-        except Exception:
-            await callback.answer("Слот не найден", show_alert=True); return
+    if free_time:
+        # свободное время — сразу к выбору действия
+        slot = {"place": school, "start": "00:00", "end": "23:59", "free_time": True}
+        STATE[uid] = {"phase": "pick_action", "slot": slot}
+        await callback.message.answer(f"Место: <b>{school}</b> — свободное время\nВыберите действие:", reply_markup=actions_kb())
+        await callback.answer(); return
 
+    # соберем слоты ТОЛЬКО этой школы на сегодня
+    slots = [s for s in day if s.get("place") == school]
+    if not slots:
+        await callback.message.answer(f"Сегодня в «{school}» нет слотов.")
+        STATE[uid] = {"phase": "idle"}
+        await callback.answer(); return
+
+    STATE[uid] = {"phase": "pick_time", "school": school, "slots_for_school": slots}
+    kb = InlineKeyboardMarkup()
+    for i, s in enumerate(slots[:50]):
+        kb.add(InlineKeyboardButton(f"{s['start']}–{s['end']}", callback_data=f"cs:time:{i}"))
+    await callback.message.answer(f"Школа: <b>{school}</b>\nВыберите время:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cs:time:"))
+async def choose_time(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    st = STATE.get(uid, {})
+    if st.get("phase") != "pick_time":
+        await callback.answer(); return
+    idx = int(callback.data.split(":")[2])
+    slots = st.get("slots_for_school", [])
+    if idx < 0 or idx >= len(slots):
+        await callback.answer("Не найдено"); return
+    slot = dict(slots[idx])
+    slot["free_time"] = PLACES.get(slot["place"], {}).get("free_time", False)
     STATE[uid] = {"phase": "pick_action", "slot": slot}
-    label = "свободное время" if slot.get("free_time") else f"{slot['start']}–{slot['end']}"
     await callback.message.answer(
-        f"Место: <b>{slot['place']}</b> — {label}\nВыберите действие:",
+        f"Место: <b>{slot['place']}</b> — {slot['start']}–{slot['end']}\nВыберите действие:",
         reply_markup=actions_kb()
     )
     await callback.answer()
 
-# ====== выбор действия ======
 @dp.callback_query_handler(lambda c: c.data.startswith("act:"))
 async def on_action(callback: types.CallbackQuery):
     uid = callback.from_user.id
     st = STATE.get(uid, {})
     if st.get("phase") != "pick_action" or "slot" not in st:
-        await callback.answer("Сначала выберите слот", show_alert=True); return
+        await callback.answer("Сначала выберите школу и время", show_alert=True); return
     action = callback.data.split(":")[1]  # in/out
     slot = st["slot"]
     STATE[uid] = {"phase": "await_location", "slot": slot, "action": action}
@@ -467,7 +522,7 @@ async def on_action(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# ====== приём локации ======
+# ====== ПРИЁМ ЛОКАЦИИ ======
 @dp.message_handler(content_types=["location"])
 async def on_location(message: types.Message):
     try:
@@ -475,7 +530,7 @@ async def on_location(message: types.Message):
         uid = message.from_user.id
         st = STATE.get(uid, {})
         if st.get("phase") != "await_location":
-            await message.answer("Сначала выберите слот: «Отметиться (выбрать слот)».", reply_markup=main_kb(uid))
+            await message.answer("Сначала выберите школу и время через «Отметиться (выбрать слот)».", reply_markup=main_kb(uid))
             return
 
         slot = st["slot"]; action = st["action"]
@@ -498,7 +553,7 @@ async def on_location(message: types.Message):
 
         # Время
         if place.get("free_time"):
-            on_time = bool(in_radius)  # SNR: «во время» == в радиусе
+            on_time = bool(in_radius)
             timing_line = "⏰ Свободное посещение (без расписания)"
         else:
             if in_radius:
@@ -507,7 +562,6 @@ async def on_location(message: types.Message):
                 start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
                 end_dt   = now.replace(hour=eh, minute=em, second=0, microsecond=0)
                 if action == "in":
-                    # учитываем грейс (10 минут по настройке)
                     on_time = now <= (start_dt + timedelta(minutes=LATE_GRACE_MIN))
                     timing_line = f"⏰ Должен быть к: {slot['start']} (+{LATE_GRACE_MIN} мин)"
                 else:
@@ -517,7 +571,7 @@ async def on_location(message: types.Message):
                 on_time = False
                 timing_line = f"⏰ Слот: {slot.get('start','')}-{slot.get('end','')}"
 
-        # Текст ответа
+        # Ответ
         lines = [
             f"📍 <b>{prof['name']}</b>",
             f"🏫 {place['full']}",
@@ -533,16 +587,12 @@ async def on_location(message: types.Message):
             on_time = False
             status_line = "⚠️ Проверка радиуса недоступна"
         elif in_radius is False:
-            status_line = f"🚫 Вы ещё не прибыли (вне радиуса, {pretty_m(dist_m) if dist_m is not None else 'расстояние неизвестно'})"
+            status_line = f"🚫 Вне радиуса ({pretty_m(dist_m) if dist_m is not None else 'N/A'})"
         else:
-            if place.get("free_time"):
-                status_line = "✅ Прибыл" if on_time else "⛔ Не засчитано"
-            else:
-                status_line = "✅ ВО ВРЕМЯ" if on_time else ("⏳ ОПОЗДАЛ❗️" if action == "in" else "⏳ Рано ушёл")
+            status_line = ("✅ Прибыл" if place.get("free_time") else ("✅ ВО ВРЕМЯ" if on_time else ("⏳ ОПОЗДАЛ❗️" if action == "in" else "⏳ Рано ушёл")))
 
         lines.append(status_line)
         lines.append(timing_line)
-
         text = "\n".join(lines)
 
         await message.answer(text, reply_markup=main_kb(uid), disable_web_page_preview=True)
@@ -551,7 +601,6 @@ async def on_location(message: types.Message):
                 await bot.send_message(chat_id, text, disable_web_page_preview=True)
                 await bot.send_location(chat_id, latitude=lat, longitude=lon)
 
-        # Запись в CSV
         with CHECKS_CSV.open("a", encoding="utf-8", newline="") as f:
             w = csv.writer(f, delimiter=";")
             w.writerow([
@@ -581,14 +630,24 @@ async def admin_actions(callback: types.CallbackQuery):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
 
-    parts = callback.data.split(":", 2)  # максимум 3 части
+    parts = callback.data.split(":", 2)
     action = parts[1] if len(parts) > 1 else ""
 
     if action == "add_wizard":
         STATE[callback.from_user.id] = {"phase": "add_place_name"}
-        await callback.message.answer("Введите название садика (одно сообщение).")
-        await callback.answer()
-        return
+        await callback.message.answer("Введите название школы/садика (одно сообщение).")
+        await callback.answer(); return
+
+    if action == "add_lesson":
+        names = sorted(PLACES.keys())
+        if not names:
+            await callback.message.answer("Нет школ в базе — сначала добавьте школу.")
+            await callback.answer(); return
+        kb = InlineKeyboardMarkup()
+        for n in names[:50]:
+            kb.add(InlineKeyboardButton(n, callback_data=f"admin:choose_school:{n}"))
+        await callback.message.answer("Выберите школу, куда добавить урок:", reply_markup=kb)
+        await callback.answer(); return
 
     if action == "list_places":
         lines = ["📍 Список мест:"]
@@ -596,61 +655,125 @@ async def admin_actions(callback: types.CallbackQuery):
             tag = " (свободное время)" if p.get("free_time") else ""
             lines.append(f"- {name}{tag} — ({p.get('lat')}, {p.get('lon')}), r={int(p.get('radius_m',RADIUS_M_DEFAULT))}м")
         await callback.message.answer("\n".join(lines))
-        await callback.answer()
-        return
+        await callback.answer(); return
 
     if action == "del_place":
         names = [n for n,p in sorted(PLACES.items()) if not p.get("free_time")]
         if not names:
-            await callback.message.answer("Нет садиков для удаления.")
-            await callback.answer()
-            return
+            await callback.message.answer("Нет школ для удаления.")
+            await callback.answer(); return
         kb = InlineKeyboardMarkup()
         for n in names[:50]:
             kb.add(InlineKeyboardButton(f"🗑 {n}", callback_data=f"admin:del:{n}"))
-        await callback.message.answer("Выберите садик для удаления:", reply_markup=kb)
-        await callback.answer()
-        return
-
-    if action == "del" and len(parts) == 3:
-        name = parts[2]
-        if name not in PLACES:
-            await callback.message.answer(f"❌ Место «{name}» не найдено.")
-            await callback.answer()
-            return
-        if PLACES[name].get("free_time"):
-            await callback.message.answer("Нельзя удалить SNR School.")
-            await callback.answer()
-            return
-
-        del PLACES[name]
-        for wd in list(SCHEDULE.keys()):
-            SCHEDULE[wd] = [s for s in SCHEDULE.get(wd, []) if s.get("place") != name]
-
-        await callback.message.answer(f"✅ Садик «{name}» успешно удалён из базы и расписания.")
-        await callback.answer("Удалено")
-        return
+        await callback.message.answer("Выберите школу/садик для полного удаления:", reply_markup=kb)
+        await callback.answer(); return
 
     if action == "list_today":
         now = datetime.now(TZ); wd = now.weekday()
         day = SCHEDULE.get(wd, [])
         lines = [f"Слоты на сегодня ({weekday_ru(now)}):"]
-        if not day:
-            lines.append("— нет —")
+        if not day: lines.append("— нет —")
         for s in day:
             lines.append(f"• {s['place']}: {s['start']}–{s['end']}")
         await callback.message.answer("\n".join(lines))
-        await callback.answer()
-        return
+        await callback.answer(); return
+
+    # Выбор школы для ДОБАВЛЕНИЯ урока
+    if action == "choose_school" and len(parts) == 3:
+        school = parts[2]
+        STATE[callback.from_user.id] = {"phase": "add_lesson_choose_school"}
+        await callback.message.answer(f"Выбрана школа: <b>{school}</b>\nТеперь отправьте ТЕКСТОМ её название ещё раз для подтверждения и дальше время урока.")
+        # (ниже текстовый роутер примет название и продолжит визард)
+        await callback.answer(); return
+
+    # УДАЛЕНИЕ КОНКРЕТНОГО УРОКА
+    if action == "del_lesson":
+        names = sorted({s["place"] for wd, lst in SCHEDULE.items() for s in lst})
+        if not names:
+            await callback.message.answer("Нет уроков в расписании.")
+            await callback.answer(); return
+        kb = InlineKeyboardMarkup()
+        for i, n in enumerate(names[:50]):
+            kb.add(InlineKeyboardButton(n, callback_data=f"adl:school:{i}"))
+        # сохраним список для индексации
+        STATE[callback.from_user.id] = {"phase": "adl_pick_school", "adl_schools": names}
+        await callback.message.answer("Выберите школу, из которой нужно удалить урок:", reply_markup=kb)
+        await callback.answer(); return
+
+    if action == "del" and len(parts) == 3:
+        name = parts[2]
+        if name not in PLACES:
+            await callback.message.answer(f"❌ Место «{name}» не найдено.")
+            await callback.answer(); return
+        if PLACES[name].get("free_time"):
+            await callback.message.answer("Нельзя удалить SNR School.")
+            await callback.answer(); return
+        del PLACES[name]
+        for wd in list(SCHEDULE.keys()):
+            SCHEDULE[wd] = [s for s in SCHEDULE.get(wd, []) if s.get("place") != name]
+        await callback.message.answer(f"✅ «{name}» удалён полностью (включая уроки).")
+        await callback.answer("Удалено"); return
 
     await callback.answer()
 
-# ====== LATE CHECKER (штрафы без привязки к учителям) ======
+# Коллбэки для удаления УРОКА
+@dp.callback_query_handler(lambda c: c.data.startswith("adl:school:"))
+async def adl_choose_school(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    st = STATE.get(uid, {})
+    if st.get("phase") != "adl_pick_school":
+        await callback.answer(); return
+    idx = int(callback.data.split(":")[2])
+    schools = st.get("adl_schools", [])
+    if idx < 0 or idx >= len(schools):
+        await callback.answer("Не найдено"); return
+    school = schools[idx]
+
+    # соберём все уроки этой школы по всем дням
+    candidates = []
+    for wd in range(7):
+        for slot in SCHEDULE.get(wd, []):
+            if slot.get("place") == school:
+                candidates.append({"wd": wd, "start": slot["start"], "end": slot["end"], "place": school})
+
+    if not candidates:
+        await callback.message.answer(f"В «{school}» нет уроков.")
+        STATE[uid] = {"phase": "idle"}
+        await callback.answer(); return
+
+    STATE[uid] = {"phase": "adl_pick_lesson", "adl_candidates": candidates}
+    kb = InlineKeyboardMarkup()
+    for i, c in enumerate(candidates[:50]):
+        kb.add(InlineKeyboardButton(f"{day_short(c['wd'])} {c['start']}-{c['end']}", callback_data=f"adl:pick:{i}"))
+    await callback.message.answer(f"Выбрано: {school}\nВыберите урок для удаления:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adl:pick:"))
+async def adl_do_delete(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    st = STATE.get(uid, {})
+    if st.get("phase") != "adl_pick_lesson":
+        await callback.answer(); return
+    idx = int(callback.data.split(":")[2])
+    cand = st.get("adl_candidates", [])
+    if idx < 0 or idx >= len(cand):
+        await callback.answer("Не найдено"); return
+    item = cand[idx]
+
+    wd = item["wd"]; start = item["start"]; end = item["end"]; place = item["place"]
+    before = len(SCHEDULE.get(wd, []))
+    SCHEDULE[wd] = [s for s in SCHEDULE.get(wd, []) if not (s["place"] == place and s["start"] == start and s["end"] == end)]
+    after = len(SCHEDULE.get(wd, []))
+
+    if after < before:
+        await callback.message.answer(f"✅ Удалён урок «{place}» {day_short(wd)} {start}-{end}.")
+    else:
+        await callback.message.answer("❌ Не удалось найти урок для удаления (возможно, уже удалён).")
+    STATE[uid] = {"phase": "idle"}
+    await callback.answer("Готово")
+
+# ====== LATE CHECKER ======
 async def late_watcher():
-    """
-    Ежеминутно проверяем слоты текущего дня:
-    если к start + LATE_GRACE_MIN НИКТО не сделал чек-ин в радиусе — шлём 1 сообщение в админ-чат.
-    """
     await asyncio.sleep(3)
     while True:
         try:
@@ -667,7 +790,7 @@ async def late_watcher():
             for slot in day_slots:
                 place = slot["place"]
                 if PLACES.get(place, {}).get("free_time"):
-                    continue  # SNR и подобные не штрафуем
+                    continue
 
                 sh, sm = map(int, slot["start"].split(":"))
                 start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
@@ -678,20 +801,17 @@ async def late_watcher():
 
                 slot_key = (date_s, wd, place, slot["start"])
                 if slot_key in LATE_SENT_SLOTS:
-                    continue  # уже уведомляли
+                    continue
 
                 had_any_valid_in = False
                 for r in rows:
-                    r_place = (r.get("place_full") or r.get("place_key") or "").strip()
-                    if r_place != place:
-                        continue
-                    if r.get("date") != date_s:
-                        continue
-                    if r.get("action") != "in" or r.get("in_radius") != "1":
-                        continue
-                    # aware-время в TZ
+                    r_place = r.get("place_full") or r.get("place_key")
+                    if r_place != place: continue
+                    if r.get("date") != date_s: continue
+                    if r.get("action") != "in" or r.get("in_radius") != "1": continue
                     try:
-                        rt = datetime.strptime(f"{r.get('date')} {r.get('time')}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+                        rt_naive = datetime.strptime(f"{r.get('date')} {r.get('time')}", "%Y-%m-%d %H:%M")
+                        rt = rt_naive.replace(tzinfo=TZ)
                     except Exception:
                         continue
                     if (start_dt - timedelta(minutes=30)) <= rt <= penalty_time:
@@ -721,16 +841,10 @@ async def global_errors(update, error):
 
 # ====== ЗАПУСК ======
 if __name__ == "__main__":
-    try:
-        ensure_files()
-        load_profiles_cache()
-        load_places_runtime()
-        log.info("Starting polling...")
-        loop = asyncio.get_event_loop()
-        loop.create_task(late_watcher())
-        executor.start_polling(dp, skip_updates=True)
-    except Exception as e:
-        import traceback
-        print("⚠️ Критическая ошибка при старте:", type(e).__name__, e)
-        traceback.print_exc()
-        input("\nНажмите Enter, чтобы закрыть окно...")
+    ensure_files()
+    load_profiles_cache()
+    load_places_runtime()
+    log.info("Starting polling...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(late_watcher())
+    executor.start_polling(dp, skip_updates=True)
