@@ -19,7 +19,7 @@ from aiogram.types import (
 
 # ============ НАСТРОЙКИ ============
 # НЕ коммить в публичный репозиторий с реальным токеном!
-HARDCODED_FALLBACK_TOKEN = "8278332572:AAFT7ijU1Gc_I3KmXsmD7QNXaWSY-OXd39A"  # ← подставь локально (или используй env)
+HARDCODED_FALLBACK_TOKEN = "8278332572:AAF15AiJXhearpiH2TARQLHXRJMOZQdRXeE"  # ← подставь локально (или используй env)
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or HARDCODED_FALLBACK_TOKEN
 if not API_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (и HARDCODED_FALLBACK_TOKEN не задан).")
@@ -848,4 +848,5 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(late_watcher())
     executor.start_polling(dp, skip_updates=True)
+
 
