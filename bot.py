@@ -20,7 +20,7 @@ from aiogram.types import (
 )
 
 # ============ НАСТРОЙКИ ============
-HARDCODED_FALLBACK_TOKEN = "8278332572:AAHzttbejyLSNZLRbION8v0NtGKlnFwJ2Tg"
+HARDCODED_FALLBACK_TOKEN = "8278332572:AAHY_mSEUpUU-BBksFvvIQO742NDAJ5e0J0"
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or HARDCODED_FALLBACK_TOKEN
 if not API_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
@@ -869,3 +869,4 @@ if __name__=="__main__":
     loop=asyncio.get_event_loop()
     loop.create_task(late_watcher())
     executor.start_polling(dp, skip_updates=True)
+
