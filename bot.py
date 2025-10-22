@@ -1,42 +1,57 @@
-# bot.py — aiogram 2.25.1, SQLite + CSV
+# bot.py — aiogram 2.25.1, SQLite, анти-пересыл, бэкап/восстановление, напоминания, персональные правила SNR
 # pip install aiogram==2.25.1
 
-import csv
-import logging
-import asyncio
-import json
-from contextlib import suppress
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
 import os
+import csv
+import json
+import asyncio
+import logging
 import sqlite3
+from contextlib import suppress
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.exceptions import Throttled
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove, InputFile
 )
 
 # ============ НАСТРОЙКИ ============
-HARDCODED_FALLBACK_TOKEN = "8278332572:AAGqTdd-KJ1kTdzHyFA6motjtjsx98YEXDM"
+HARDCODED_FALLBACK_TOKEN = "8278332572:AAHAYzg0_GvRmmWhUgbndOYlSwB790OfNHE"
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or HARDCODED_FALLBACK_TOKEN
 if not API_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
+# Админы и админ-группы
 ADMIN_IDS = {1790286972, 2062714005}
 ADMIN_CHAT_IDS = {-1002362042916}
 
+# Гео/время
 RADIUS_M_DEFAULT = 200.0
 CITY_TZ_HOURS = 5
-LATE_GRACE_MIN = 10
+LATE_GRACE_MIN = 10                         # глобальная «поздно» для /late_watcher пингов (может не использоваться для оценки чек-ина)
+REMINDERS_ON = os.getenv("REMINDERS", "0") == "1"  # напоминания за 10 минут
 
-# — закреплённая точка для отметки 24/7 —
+# Закреплённое место (SNR — доступно всегда)
 ALWAYS_PLACE_KEY = "SNR School"
 ALWAYS_PLACE_FULL = "SNR School (офис)"
 ALWAYS_PLACE_LAT = 41.322921
 ALWAYS_PLACE_LON = 69.277808
+
+# Персональные правила SNR (ТОЛЬКО для SNR School)
+# user_id: разрешённое опоздание (минуты)
+SNR_SPECIAL_GRACE = {
+    5280510534: 15,   # Ситора Муслимова
+    1677978086: 15,   # Камола Нарзиева
+    1033120831: 10,   # Сарварбек Эшмуродов
+    1790286972: 10,   # Аббосхон Азларов
+}
+# Пользователь, который должен быть в SNR к 09:00 (+10 мин максимум)
+SNR_MUST_BE_9_ID = 7819786422
+SNR_MUST_BE_9_GRACE = 10
 
 # ---- ЛОГИ ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -57,12 +72,11 @@ DATA_DIR = Path("."); DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "data.db"
 CHECKS_CSV = DATA_DIR / "checks.csv"
 PROFILES_CSV = DATA_DIR / "profiles.csv"
-PLACES_JSON = DATA_DIR / "places.json"
-SCHEDULE_JSON = DATA_DIR / "schedule.json"
 
 # ====== РАНТАЙМ ======
-STATE = {}          # визарды
+STATE = {}          # визарды/состояния
 LATE_SENT_SLOTS = set()
+REMINDER_SENT = set()  # (date, place_key, start) чтобы 10-минутные не слали многократно
 
 # ====== БОТ ======
 bot = Bot(token=API_TOKEN, parse_mode="HTML")
@@ -126,7 +140,7 @@ def is_forwarded(msg: types.Message) -> bool:
         hasattr(msg, "forward_origin") and getattr(msg, "forward_origin") is not None,
     ])
 
-# ====== CSV (старая табличка) ======
+# ====== CSV ======
 def ensure_csv_files():
     if not CHECKS_CSV.exists():
         with CHECKS_CSV.open("w", encoding="utf-8", newline="") as f:
@@ -182,24 +196,20 @@ def write_profile_to_csv(uid:int, name:str, phone:str):
         for k,(n,p) in rows.items():
             w.writerow([k,n,p])
 
-# ====== БАЗА ДАННЫХ ======
+# ====== БАЗА ДАННЫХ (SQLite) ======
 def db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
+    conn = db(); cur = conn.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS profiles (
         telegram_id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         phone TEXT DEFAULT ''
     )""")
-
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS places (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,7 +219,6 @@ def init_db():
         lon REAL,
         radius_m REAL DEFAULT {RADIUS_M_DEFAULT}
     )""")
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS schedule (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,7 +228,6 @@ def init_db():
         place_key TEXT NOT NULL,
         FOREIGN KEY(place_key) REFERENCES places(key)
     )""")
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS checks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,54 +249,16 @@ def init_db():
         on_time INTEGER,
         notes TEXT
     )""")
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS stopped (
-        telegram_id INTEGER PRIMARY KEY
-    )""")
-
-    conn.commit()
-    conn.close()
-
-def import_legacy():
-    conn = db(); cur = conn.cursor()
-    # places
-    cur.execute("SELECT COUNT(*) AS c FROM places")
-    if cur.fetchone()["c"] == 0 and PLACES_JSON.exists():
-        try:
-            places = json.loads(PLACES_JSON.read_text(encoding="utf-8"))
-            for k, v in places.items():
-                cur.execute("INSERT OR IGNORE INTO places(key, full, lat, lon, radius_m) VALUES(?,?,?,?,?)",
-                            (k, v.get("full", k), v.get("lat"), v.get("lon"), v.get("radius_m", RADIUS_M_DEFAULT)))
-        except Exception:
-            pass
-    # schedule
-    cur.execute("SELECT COUNT(*) AS c FROM schedule")
-    if cur.fetchone()["c"] == 0 and SCHEDULE_JSON.exists():
-        try:
-            sched = json.loads(SCHEDULE_JSON.read_text(encoding="utf-8"))
-            for wd_str, slots in sched.items():
-                wd = int(wd_str)
-                for s in slots:
-                    cur.execute("INSERT INTO schedule(weekday,start,end,place_key) VALUES(?,?,?,?)",
-                                (wd, s["start"], s["end"], s["place"]))
-        except Exception:
-            pass
-    # profiles
-    if PROFILES_CSV.exists():
-        try:
-            with PROFILES_CSV.open("r", encoding="utf-8", newline="") as f:
-                r = csv.DictReader(f, delimiter=";")
-                for row in r:
-                    try:
-                        tid = int(row["telegram_id"])
-                        cur.execute("INSERT OR IGNORE INTO profiles(telegram_id,name,phone) VALUES(?,?,?)",
-                                    (tid, row.get("teacher_name",""), row.get("phone","")))
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+    cur.execute("""CREATE TABLE IF NOT EXISTS stopped (telegram_id INTEGER PRIMARY KEY)""")
+    # индексы
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_schedule_wd_place_start ON schedule(weekday, place_key, start)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_checks_date_place_action ON checks(date, place_key, action)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_checks_date_tid ON checks(date, telegram_id)")
     conn.commit(); conn.close()
+
+def import_legacy_if_empty():
+    """Оставлено на случай, если где-то есть JSON-сид — сейчас не используем."""
+    return
 
 def ensure_always_place():
     conn = db(); cur = conn.cursor()
@@ -369,6 +339,72 @@ def set_stopped(uid:int, stop:bool):
         cur.execute("DELETE FROM stopped WHERE telegram_id=?", (uid,))
     conn.commit(); conn.close()
 
+# ====== BACKUP / RESTORE ======
+def dump_data_for_backup() -> dict:
+    conn = db(); cur = conn.cursor()
+    cur.execute("SELECT key, full, lat, lon, radius_m FROM places ORDER BY key")
+    places = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT weekday, start, end, place_key FROM schedule ORDER BY weekday, start")
+    schedule = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"version": 1, "places": places, "schedule": schedule}
+
+def load_data_from_backup(payload: dict):
+    assert isinstance(payload, dict) and "places" in payload and "schedule" in payload
+    conn = db(); cur = conn.cursor()
+    cur.execute("DELETE FROM schedule")
+    cur.execute("DELETE FROM places")
+    for p in payload["places"]:
+        cur.execute(
+            "INSERT INTO places(key,full,lat,lon,radius_m) VALUES(?,?,?,?,?)",
+            (p["key"], p["full"], p.get("lat"), p.get("lon"), p.get("radius_m") or RADIUS_M_DEFAULT)
+        )
+    for s in payload["schedule"]:
+        cur.execute(
+            "INSERT INTO schedule(weekday,start,end,place_key) VALUES(?,?,?,?)",
+            (int(s["weekday"]), s["start"], s["end"], s["place_key"])
+        )
+    conn.commit(); conn.close()
+    ensure_always_place()
+
+@dp.message_handler(commands=["backup"])
+async def cmd_backup(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет доступа."); return
+    data = dump_data_for_backup()
+    path = DATA_DIR / "backup.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    await bot.send_document(message.chat.id, InputFile(str(path)),
+                            caption=f"backup {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}")
+
+@dp.message_handler(commands=["restore"])
+async def cmd_restore(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет доступа."); return
+    STATE[message.from_user.id] = {"phase": "await_restore_file"}
+    await message.answer("Пришлите файл <code>backup.json</code> с подписью <b>restore</b>.")
+
+@dp.message_handler(content_types=["document"])
+async def on_doc_restore(message: types.Message):
+    uid = message.from_user.id
+    if STATE.get(uid, {}).get("phase") != "await_restore_file":
+        return
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет доступа."); return
+    if (message.caption or "").strip().lower() != "restore":
+        await message.answer("Нужна подпись (caption) <b>restore</b> у файла."); return
+    try:
+        file = await bot.get_file(message.document.file_id)
+        tmp = DATA_DIR / "restore_tmp.json"
+        await bot.download_file(file.file_path, destination=tmp)
+        payload = json.loads(tmp.read_text(encoding="utf-8"))
+        load_data_from_backup(payload)
+        STATE[uid] = {"phase":"idle"}
+        await message.answer("✅ Восстановлено: школы/сады и расписание.")
+    except Exception as e:
+        log.exception("restore failed")
+        await message.answer(f"❌ Ошибка восстановления: {e}")
+
 # ====== СТАРТ / СТОП ======
 @dp.message_handler(commands=["stop"])
 async def cmd_stop(message: types.Message):
@@ -391,9 +427,8 @@ async def guard_stopped_callbacks(callback: types.CallbackQuery):
 async def on_start(message: types.Message):
     ensure_csv_files()
     init_db()
-    import_legacy()
+    import_legacy_if_empty()
     ensure_always_place()
-
     uid = message.from_user.id
     set_stopped(uid, False)
 
@@ -417,19 +452,50 @@ async def cmd_my(message: types.Message):
     prof = get_profile(uid) or {"name": message.from_user.full_name, "phone": ""}
     await message.answer(f"👤 Профиль\nИмя: <b>{prof['name']}</b>\nТелефон: <b>{prof.get('phone','')}</b>")
 
+# ====== «РАСПИСАНИЕ НА СЕГОДНЯ» С ПОДСПИСКОМ ПО ШКОЛЕ ======
 @dp.message_handler(commands=["schedule","today"])
 async def cmd_schedule(message: types.Message):
     now = datetime.now(TZ); wd = now.weekday()
     rows = list_schedule(wd)
-    lines = [f"Расписание на <b>{weekday_ru(now)}</b>:"]
-    if not rows:
-        lines.append("• (слотов нет)")
-    else:
-        for r in rows:
-            lines.append(f"• {r['place_key']}: {r['start']}–{r['end']}")
-    await message.answer("\n".join(lines))
+    schools_today = sorted({r["place_key"] for r in rows})
+    ensure_always_place()
+    if ALWAYS_PLACE_KEY not in schools_today:
+        schools_today.append(ALWAYS_PLACE_KEY)
+    if not schools_today:
+        await message.answer(f"Расписание на <b>{weekday_ru(now)}</b>:\n• (слотов нет)")
+        return
+    kb = InlineKeyboardMarkup()
+    for i, name in enumerate(schools_today[:50]):
+        kb.add(InlineKeyboardButton(name, callback_data=f"tday:school:{i}"))
+    STATE[message.from_user.id] = {"phase": "pick_school_today", "schools": schools_today}
+    await message.answer(f"Расписание на <b>{weekday_ru(now)}</b>:\nВыберите школу, чтобы увидеть слоты.", reply_markup=kb)
 
-# ====== АДМИН ======
+@dp.callback_query_handler(lambda c: c.data.startswith("tday:school:"))
+async def cb_today_school(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    st = STATE.get(uid,{})
+    idx = int(callback.data.split(":")[2])
+    schools = st.get("schools",[])
+    if idx<0 or idx>=len(schools):
+        with suppress(Exception): await callback.answer()
+        return
+    school = schools[idx]
+    wd = datetime.now(TZ).weekday()
+    conn = db(); cur = conn.cursor()
+    cur.execute("SELECT start,end FROM schedule WHERE weekday=? AND place_key=? ORDER BY start", (wd, school))
+    slots = cur.fetchall(); conn.close()
+    if not slots and school == ALWAYS_PLACE_KEY:
+        await callback.message.answer(f"🏫 {school}\n• Доступно для отметки: 00:00–23:59 (круглосуточно)")
+    elif not slots:
+        await callback.message.answer(f"🏫 {school}\n• (слотов нет сегодня)")
+    else:
+        lines = [f"🏫 {school} — слоты на сегодня:"]
+        for s in slots:
+            lines.append(f"• {s['start']}–{s['end']}")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+# ====== АДМИН МЕНЮ (как было) ======
 def admin_menu_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("➕ Добавить школу", callback_data="admin:add_place"))
@@ -445,7 +511,7 @@ async def admin_menu(message: types.Message):
         await message.answer("⛔ Нет доступа."); return
     await message.answer("🔧 Панель администратора:", reply_markup=admin_menu_kb())
 
-# ====== ВИЗАРДЫ ДОБАВЛЕНИЯ ШКОЛ/УРОКОВ ======
+# ====== ВИЗАРДЫ ДОБАВЛЕНИЯ/УДАЛЕНИЯ ======
 @dp.callback_query_handler(lambda c: c.data == "admin:add_place")
 async def cb_add_place(callback: types.CallbackQuery):
     uid = callback.from_user.id
@@ -635,7 +701,6 @@ async def text_router(message: types.Message):
     if txt == "✅ Отметиться":
         rows = today_slots()
         schools_today = sorted({r["place_key"] for r in rows})
-        # Всегда добавляем закреплённую точку (24/7)
         ensure_always_place()
         if ALWAYS_PLACE_KEY not in schools_today:
             schools_today.append(ALWAYS_PLACE_KEY)
@@ -681,14 +746,19 @@ async def choose_school(callback: types.CallbackQuery):
     cur.execute("SELECT start,end FROM schedule WHERE weekday=? AND place_key=? ORDER BY start", (wd, school))
     slots = cur.fetchall(); conn.close()
 
-    # если это SNR School и слотов нет — подставляем 00:00–23:59
+    # Если это SNR School и слотов нет — показываем 00:00–23:59
     if (not slots) and school == ALWAYS_PLACE_KEY:
         slots = [{"start": "00:00", "end": "23:59"}]
 
     kb = InlineKeyboardMarkup()
     for i, s in enumerate(slots[:50]):
-        kb.add(InlineKeyboardButton(f"{s['start']}-{s['end']}", callback_data=f"cs:time:{i}"))
-    STATE[uid] = {"phase":"pick_time","slots":[dict(s) | {"place":school} for s in slots]}
+        s_start = s['start'] if isinstance(s, sqlite3.Row) else s['start']
+        s_end   = s['end']   if isinstance(s, sqlite3.Row) else s['end']
+        kb.add(InlineKeyboardButton(f"{s_start}-{s_end}", callback_data=f"cs:time:{i}"))
+    # Храним слоты в STATE
+    STATE[uid] = {"phase":"pick_time","slots":[{"start": (s['start'] if isinstance(s, sqlite3.Row) else s['start']),
+                                                "end":   (s['end']   if isinstance(s, sqlite3.Row) else s['end']),
+                                                "place": school} for s in slots]}
     await callback.message.answer(f"Школа: {school}\nВыберите время:", reply_markup=kb)
     await callback.answer()
 
@@ -724,17 +794,22 @@ async def on_action(callback: types.CallbackQuery):
     await callback.message.answer(f"{'Чек-ин' if action=='in' else 'Чек-аут'} для {slot['place']}. Отправьте геолокацию:", reply_markup=kb)
     await callback.answer()
 
-# ====== ДОБАВЛЕНО: отчёт в админ-чат ======
+# ====== ОТПРАВКА ОТЧЁТА В АДМИН-ЧАТ ======
 async def report_check_to_admins(*, teacher_name: str, place_full: str, weekday_str: str,
                                  now_str: str, slot_start: str, slot_end: str, action: str,
-                                 in_radius, dist, on_time, lat: float, lon: float):
+                                 in_radius, dist, on_time_flag, lat: float, lon: float,
+                                 is_snr: bool, show_time_status: bool):
     act_text = "Чек-ин" if action == "in" else "Чек-аут"
     status = []
-    if action == "in":
-        if on_time is True:
+
+    # Показ статуса «во время/поздно» скрываем для SNR по умолчанию
+    if show_time_status:
+        if on_time_flag is True:
             status.append("✅ ВО ВРЕМЯ")
-        elif on_time is False:
-            status.append("⚠️ ПОЗДНО")
+        elif on_time_flag is False:
+            status.append("🛑 ПОЗДНО")
+
+    # Радиус
     if in_radius is True:
         status.append(f"✅ В радиусе ({pretty_m(dist)})")
     elif in_radius is False:
@@ -756,7 +831,7 @@ async def report_check_to_admins(*, teacher_name: str, place_full: str, weekday_
             await bot.send_message(chat_id, text, disable_web_page_preview=False)
             await bot.send_location(chat_id, latitude=lat, longitude=lon, disable_notification=True)
 
-# ====== LOCATION ======
+# ====== LOCATION (ГЛАВНЫЙ: жёсткий радиус, жёсткое опоздание) ======
 @dp.message_handler(content_types=["location"])
 async def on_location(message: types.Message):
     uid = message.from_user.id
@@ -788,26 +863,59 @@ async def on_location(message: types.Message):
     lat = message.location.latitude
     lon = message.location.longitude
 
+    # Проверка радиуса ОБЯЗАТЕЛЬНА для приёма чек-ина
     can_check_radius = (pl["lat"] is not None and pl["lon"] is not None)
     dist=None; in_radius=None
     if can_check_radius:
         dist=haversine_m(lat,lon,pl["lat"],pl["lon"])
         in_radius=dist<= (pl["radius_m"] or RADIUS_M_DEFAULT)
+    if (not can_check_radius) or (in_radius is not True):
+        # Не принимаем чек-ин
+        await message.answer("Вы не в радиусе 🛑\nПодойдите ближе к месту и попробуйте снова.", reply_markup=main_kb())
+        STATE[uid]={"phase":"idle"}
+        return
 
     now=datetime.now(TZ)
     wd_name = weekday_ru(now)
     act_text = "Чек-ин" if action=="in" else "Чек-аут"
 
-    on_time = None
-    try:
-        sh, sm = map(int, str(slot['start']).split(":"))
-        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-        grace_dt = start_dt + timedelta(minutes=LATE_GRACE_MIN)
-        if action == "in":
-            on_time = now <= grace_dt
-    except Exception:
-        on_time = None
+    # === Оценка «во время/поздно» ===
+    s_h, s_m = map(int, str(slot['start']).split(":"))
+    start_dt = now.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
 
+    is_snr = (slot["place"] == ALWAYS_PLACE_KEY)
+
+    # Глобальные правила:
+    # 1) Для НЕ SNR: допуск = 0 минут (строго). Любая минута позже — поздно.
+    # 2) Для SNR: по умолчанию не показываем статус времени. НО:
+    #    - особые пользователи SNR имеют персональную «grace»
+    #    - спец-пользователь должен быть к 09:00 (+10)
+    show_time_status = True
+    grace_min = 0
+
+    if not is_snr:
+        grace_min = 0
+    else:
+        # SNR — по умолчанию статусы не показываем
+        show_time_status = False
+        # Персональные правила SNR
+        if uid in SNR_SPECIAL_GRACE:
+            grace_min = SNR_SPECIAL_GRACE[uid]
+            show_time_status = True
+        elif uid == SNR_MUST_BE_9_ID:
+            # обязателен к 09:00 (+10)
+            must_h, must_m = 9, 0
+            start_dt = now.replace(hour=must_h, minute=must_m, second=0, microsecond=0)
+            grace_min = SNR_MUST_BE_9_GRACE
+            show_time_status = True
+        else:
+            grace_min = 0  # не важно — статус всё равно скрыт
+
+    on_time_flag = None
+    if action == "in":
+        on_time_flag = (now <= start_dt + timedelta(minutes=grace_min))
+
+    # === Формирование панели пользователю ===
     lines = [
         f"📍 <b>{prof['name']}</b>",
         f"🏫 {pl['full']}",
@@ -817,24 +925,20 @@ async def on_location(message: types.Message):
         f"🔄 Действие: <b>{act_text}</b>",
     ]
 
-    if action == "in" and on_time is True:
-        lines.append("✅ ВО ВРЕМЯ")
-        lines.append(f"⏰ Должен быть к: {slot['start']} (+{LATE_GRACE_MIN} мин)")
-    else:
-        if not can_check_radius:
-            lines.append("⚠️ Геолокация места не настроена — проверка радиуса пропущена")
-            lines.append("⚠️ Проверка радиуса недоступна")
-        else:
-            if in_radius is True:
-                lines.append(f"✅ В радиусе ({pretty_m(dist)})")
-            elif in_radius is False:
-                lines.append(f"🚫 Вне радиуса ({pretty_m(dist)})")
-        lines.append(f"⏰ Слот: {slot['start']}-{slot['end']}")
+    # Для SNR по умолчанию не выводим «во время/поздно», только время прибытия и радиус
+    if show_time_status:
+        if action == "in":
+            if on_time_flag:
+                lines.append("✅ ВО ВРЕМЯ")
+            else:
+                lines.append("🛑 ПОЗДНО")
+    # Радиус уже проверен (иначе бы вышли), но покажем факт
+    lines.append(f"✅ В радиусе ({pretty_m(dist)})")
 
     panel_text = "\n".join(lines)
     await message.answer(panel_text, reply_markup=main_kb())
 
-    # === ДОБАВЛЕНО: отправить отчёт в админ-чат ===
+    # === Отчёт в админ-чат (оставить) ===
     try:
         await report_check_to_admins(
             teacher_name=prof['name'],
@@ -844,22 +948,23 @@ async def on_location(message: types.Message):
             slot_start=slot['start'],
             slot_end=slot['end'],
             action=action,
-            in_radius=in_radius,
+            in_radius=True,
             dist=dist,
-            on_time=(True if (action=='in' and on_time is True) else (False if (action=='in' and on_time is False) else None)),
+            on_time_flag=on_time_flag,
             lat=lat,
-            lon=lon
+            lon=lon,
+            is_snr=is_snr,
+            show_time_status=show_time_status
         )
     except Exception:
         log.exception("report_check_to_admins failed")
-    # ================================================
 
+    # === Запись в БД/CSV ===
     on_time_int = None
-    if action == "in" and on_time is not None:
-        on_time_int = 1 if on_time else 0
-    elif in_radius is not None:
-        on_time_int = 1 if in_radius else 0
+    if action == "in" and on_time_flag is not None:
+        on_time_int = 1 if on_time_flag else 0
 
+    conn = db(); cur = conn.cursor()
     cur.execute("""INSERT INTO checks(
         telegram_id,teacher_name,phone,action,place_key,place_full,date,time,weekday,
         slot_start,slot_end,lat,lon,distance_m,in_radius,on_time,notes
@@ -868,7 +973,7 @@ async def on_location(message: types.Message):
         now.strftime("%Y-%m-%d"), now.strftime("%H:%M"), wd_name,
         slot["start"], slot["end"], float(f"{lat:.6f}"), float(f"{lon:.6f}"),
         float(round(dist,2)) if dist is not None else None,
-        1 if in_radius else 0 if in_radius is not None else None,
+        1,  # in_radius — гарантированно True на этом этапе
         on_time_int,
         ""
     ))
@@ -889,35 +994,57 @@ async def on_location(message: types.Message):
         "lat": f"{lat:.6f}",
         "lon": f"{lon:.6f}",
         "distance_m": float(round(dist,2)) if dist is not None else "",
-        "in_radius": in_radius if in_radius is not None else 0,
-        "on_time": (1 if on_time else 0) if on_time is not None else (1 if in_radius else 0 if in_radius is not None else 0),
+        "in_radius": True,
+        "on_time": (1 if on_time_flag else 0) if on_time_flag is not None else 0,
         "notes": ""
     })
 
     STATE[uid]={"phase":"idle"}
 
-# ====== LATE WATCHER ======
+# ====== НАПОМИНАНИЯ И КОНТРОЛЬ ОПОЗДАНИЙ (фоновая задача) ======
 async def late_watcher():
     await asyncio.sleep(3)
     while True:
         try:
-            now=datetime.now(TZ); wd=now.weekday(); date_s=now.strftime("%Y-%m-%d")
+            now = datetime.now(TZ)
+            wd = now.weekday()
+            date_s = now.strftime("%Y-%m-%d")
+
             conn = db(); cur = conn.cursor()
-            cur.execute("SELECT start, place_key FROM schedule WHERE weekday=?", (wd,))
+            cur.execute("SELECT start,end,place_key FROM schedule WHERE weekday=?", (wd,))
             slots = cur.fetchall()
-            cur.execute("SELECT place_key FROM checks WHERE date=? AND action='in'", (date_s,))
-            ins = {r["place_key"] for r in cur.fetchall()}
+            cur.execute("SELECT telegram_id FROM profiles")
+            teachers = [r["telegram_id"] for r in cur.fetchall()]
+            cur.execute("SELECT telegram_id, place_key FROM checks WHERE date=? AND action='in'", (date_s,))
+            ins = {(r["telegram_id"], r["place_key"]) for r in cur.fetchall()}
             conn.close()
 
             for slot in slots:
                 sh,sm=map(int,slot["start"].split(":"))
                 start_dt=now.replace(hour=sh,minute=sm,second=0,microsecond=0)
-                if now>start_dt+timedelta(minutes=LATE_GRACE_MIN):
+
+                # Напоминание за 10 минут
+                if REMINDERS_ON:
+                    rem_key = (date_s, slot["place_key"], slot["start"])
+                    if start_dt - timedelta(minutes=10) <= now < start_dt and rem_key not in REMINDER_SENT:
+                        for tid in teachers:
+                            with suppress(Exception):
+                                await bot.send_message(
+                                    tid,
+                                    f"⏰ Через 10 минут у вас урок в <b>{slot['place_key']}</b> ({slot['start']}–{slot['end']}). Не забудьте отметиться!"
+                                )
+                        REMINDER_SENT.add(rem_key)
+
+                # Старое уведомление для админов — если совсем нет чек-ина по месту
+                late_dt = start_dt + timedelta(minutes=LATE_GRACE_MIN)
+                if now>late_dt:
                     slot_key=(date_s,wd,slot["place_key"],slot["start"])
-                    if slot_key in LATE_SENT_SLOTS: continue
-                    if slot["place_key"] not in ins:
+                    if slot_key in LATE_SENT_SLOTS:
+                        continue
+                    if not any(pk == slot["place_key"] for (_tid, pk) in ins):
                         await notify_admins(f"⚠️ Нет чек-ина {slot['place_key']} {slot['start']}")
                         LATE_SENT_SLOTS.add(slot_key)
+
         except Exception:
             log.exception("late_watcher")
         await asyncio.sleep(60)
@@ -928,11 +1055,11 @@ async def global_errors(update, error):
     if isinstance(error, Throttled): return True
     log.exception("Unhandled: %r", error); return True
 
-# ====== MAIN (polling) ======
+# ====== MAIN ======
 if __name__=="__main__":
     ensure_csv_files()
     init_db()
-    import_legacy()
+    import_legacy_if_empty()
     ensure_always_place()
     log.info("Starting polling…")
     loop=asyncio.get_event_loop()
