@@ -1,10 +1,16 @@
-from flask import Flask, jsonify
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route("/")
-def home():
-    return jsonify({"status": "ok", "message": "SNR Attendance Web API working"})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+@app.get("/")
+async def home():
+    return HTMLResponse("""
+    <html>
+        <head><title>SNR Attendance</title></head>
+        <body style="font-family: Arial; text-align:center; margin-top:50px;">
+            <h1>✅ Hello SNR Teacher</h1>
+            <p>Mini-App Web Server is working!</p>
+        </body>
+    </html>
+    """)
