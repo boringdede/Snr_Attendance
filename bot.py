@@ -1056,12 +1056,18 @@ async def global_errors(update, error):
     log.exception("Unhandled: %r", error); return True
 
 # ====== MAIN ======
-if __name__=="__main__":
+if __name__ == "__main__":
     ensure_csv_files()
     init_db()
     import_legacy_if_empty()
     ensure_always_place()
-    log.info("Starting polling…")
-    loop=asyncio.get_event_loop()
-    loop.create_task(late_watcher())
-    executor.start_polling(dp, skip_updates=True)
+
+    # если переменная окружения установлена (для веб-сервиса) — не трогаем Telegram
+    if os.getenv("DISABLE_TELEGRAM"):
+        log.info("DISABLE_TELEGRAM set — skipping Telegram polling (web service mode).")
+    else:
+        log.info("Starting polling…")
+        loop = asyncio.get_event_loop()
+        loop.create_task(late_watcher())
+        executor.start_polling(dp, skip_updates=True)
+
